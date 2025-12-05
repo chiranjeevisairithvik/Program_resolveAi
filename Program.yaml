@@ -1,0 +1,130 @@
+
+trigger:
+  branches:
+    include:
+      - main
+      - master
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  # --- Adjust as needed ---
+  buildConfiguration: 'Release'
+  # Pin the SDK required by your project; if you target net6.0, 6.x SDK suffices.
+  dotnetSdkVersion: '6.0.x'
+  # If you upgrade the project to net8.0, change the SDK to '8.0.x' and remove the net6 runtime steps
+  artifactName: 'drop'
+  publishFolder: '$(Build.ArtifactStagingDirectory)/publish'
+  # Optional deploy variables (set these in Pipeline variables or here)
+  webAppName: 'my-webapi-appservice-name'         # <-- change
+  azureSubscription: 'My-ADO-Service-Connection'  # <-- change (Service connection name)
+
+stages:
+
+# ========== Build stage ==========
+- stage: Build
+  displayName: 'Build & Publish'
+  jobs:
+  - job: BuildJob
+    displayName: 'Restore, Build, Test, Publish'
+    steps:
+
+    # Ensure the correct .NET SDK is available on the agent
+    - task: UseDotNet@2
+      displayName: 'Use .NET SDK $(dotnetSdkVersion)'
+      inputs:
+        packageType: 'sdk'
+        version: '$(dotnetSdkVersion)'
+
+    # (Optional) If the app targets net6.0 and your agent only has .NET 8 runtime,
+    # add the net6 runtime so dotnet test/run can execute net6 binaries.
+    # Comment this block out if not needed or if you upgraded the app to net8.
+    - powershell: |
+        Write-Host "Installing .NET 6 runtime (Microsoft.NETCore.App) to run net6.0 binaries..."
+        winget install --id Microsoft.DotNet.Runtime.6 --source winget --accept-source-agreements --accept-package-agreements
+        winget install --id Microsoft.DotNet.AspNetCoreRuntime.6 --source winget --accept-source-agreements --accept-package-agreements
+      displayName: 'Install .NET 6 runtime (if required)'
+      condition: succeeded()
+
+    - checkout: self
+      persistCredentials: true
+
+    # Restore NuGet packages
+    - task: DotNetCoreCLI@2
+      displayName: 'dotnet restore'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+        feedsToUse: 'select'           # use project NuGet feed or public
+      # If you use an authenticated feed, configure NuGet authentication steps
+
+    # Build
+    - task: DotNetCoreCLI@2
+      displayName: 'dotnet build ($(buildConfiguration))'
+      inputs:
+        command: 'build'
+        projects: '**/*.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+
+    # Tests (optional) — if you have test projects
+    - task: DotNetCoreCLI@2
+      displayName: 'dotnet test'
+      inputs:
+        command: 'test'
+        projects: '**/*Tests.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build'
+      continueOnError: true   # do not fail pipeline if no test projects; set to false if you do
+
+    # Publish the Web API to a folder (zip will be created later)
+    - task: DotNetCoreCLI@2
+      displayName: 'dotnet publish web project'
+      inputs:
+        command: 'publish'
+        publishWebProjects: true
+        arguments: '--configuration $(buildConfiguration) --output $(publishFolder) /p:UseAppHost=false'
+        zipAfterPublish: false
+
+    # Create a zip package for App Service deployment
+    - powershell: |
+        $zipPath = "$(Build.ArtifactStagingDirectory)\$(artifactName).zip"
+        Write-Host "Zipping published output to $zipPath"
+        Add-Type -AssemblyName 'System.IO.Compression.FileSystem'
+        if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+        [System.IO.Compression.ZipFile]::CreateFromDirectory("$(publishFolder)", $zipPath)
+      displayName: 'Zip published output'
+
+    # Publish build artifacts (drop)
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: '$(artifactName)'
+
+# ========== Deploy stage (optional) ==========
+# Requires a Service Connection in Project Settings -> Service connections
+- stage: Deploy
+  displayName: 'Deploy to Azure App Service'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: DeployJob
+    displayName: 'Deploy Web API'
+    steps:
+    - download: current
+      artifact: '$(artifactName)'
+
+    # Deploy using the built-in task
+    - task: AzureWebApp@1
+      displayName: 'Azure Web App Deploy'
+      inputs:
+        azureSubscription: '$(azureSubscription)'  # service connection name
+        appType: 'webApp'
+        appName: '$(webAppName)'
+        package: '$(Pipeline.Workspace)/$(artifactName)/$(artifactName).zip'
+        runtimeStack: 'DOTNETCORE|6.0'  # set DOTNETCORE|8.0 if you upgrade to net8.0
+        # slotName: 'production'        # optional, if using deployment slots
+
+    # Optional: run warm-up or smoke tests
+    - powershell: |
+        Write-Host "Deployment done. Consider adding a smoke test here."
